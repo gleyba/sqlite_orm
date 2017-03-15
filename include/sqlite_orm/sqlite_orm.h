@@ -18,6 +18,11 @@
 #include <map>
 #include <cctype>
 #include <initializer_list>
+#include <fit.hpp>
+#include <experimental/optional>
+#include <chrono>
+
+#include <PBGlobal.h>
 
 using std::cout;
 using std::endl;
@@ -26,6 +31,24 @@ namespace sqlite_orm {
     
     //  got from here http://stackoverflow.com/questions/25958259/how-do-i-find-out-if-a-tuple-contains-a-type
     namespace tuple_helper {
+        
+        template <typename T, typename Tuple>
+        struct type_idx;
+        
+        template <typename T>
+        struct type_idx<T, std::tuple<>> {
+            static constexpr std::size_t value = -1000;
+        };
+        
+        template <typename T, typename U, typename... Ts>
+        struct type_idx<T, std::tuple<U, Ts...>> {
+            static constexpr std::size_t value = 1 + type_idx<T, std::tuple<Ts...>>::value;
+        };
+        
+        template <typename T, typename... Ts>
+        struct type_idx<T, std::tuple<T, Ts...>>{
+            static constexpr std::size_t value = 0;
+        };
         
         template <typename T, typename Tuple>
         struct has_type;
@@ -82,6 +105,11 @@ namespace sqlite_orm {
                 l(std::get<std::tuple_size<tail_tuple_t>>(t));
             }
         };*/
+        
+        template <typename T, typename Tuple>
+        T tuple_get_type(Tuple& options) {
+            return std::get<type_idx<T,Tuple>::value>(options);
+        }
     }
     
     template<class T>
@@ -103,6 +131,15 @@ namespace sqlite_orm {
     struct autoincrement {};
     
     struct primary_key {};
+    
+        struct index {};
+    
+    struct unique {};
+    
+    struct foreign_key{
+        std::string table;
+        std::string column;
+    };
     
     template<class T>
     struct default_t {
@@ -192,6 +229,9 @@ namespace sqlite_orm {
     struct type_is_nullable<std::shared_ptr<T>> : public std::true_type {};
     
     template<class T>
+    struct type_is_nullable<std::experimental::optional<T>> : public std::true_type {};
+    
+    template<class T>
     struct type_is_nullable<std::unique_ptr<T>> : public std::true_type {};
     
     template<class O, class T, class ...Op>
@@ -203,7 +243,7 @@ namespace sqlite_orm {
         
         const std::string name;
         field_type object_type::*member_pointer;
-        options_type options;
+        mutable options_type options;
         
         bool not_null() const {
             return !type_is_nullable<field_type>::value;
@@ -212,6 +252,17 @@ namespace sqlite_orm {
         template<class Opt>
         constexpr bool has() const {
             return tuple_helper::tuple_contains_type<Opt, options_type>::value;
+        }
+        
+        template<class Opt>
+        constexpr auto has_() const {
+            return std::integral_constant<bool,tuple_helper::tuple_contains_type<Opt, options_type>::value>();
+        }
+        
+        template<class Opt>
+        constexpr Opt get() const {
+            static_assert(tuple_helper::has_type<Opt,options_type>::value,"");
+            return tuple_helper::tuple_get_type<Opt, options_type>(options);
         }
         
         template<class O1, class O2, class ...Opts>
@@ -265,6 +316,22 @@ namespace sqlite_orm {
     };
     
     template<>
+    struct type_printer<bool> : public integer_printer {
+        /*inline const std::string& print() {
+            static const std::string res = "INTEGER";
+            return res;
+        }*/
+    };
+    
+    template<>
+    struct type_printer<std::chrono::system_clock::time_point> : public integer_printer {
+        /*inline const std::string& print() {
+            static const std::string res = "INTEGER";
+            return res;
+        }*/
+    };
+    
+    template<>
     struct type_printer<std::string> : public text_printer {
         /*inline const std::string& print() {
             static const std::string res = "TEXT";
@@ -294,13 +361,31 @@ namespace sqlite_orm {
         }*/
     };
     
+    template<class T>
+    struct type_printer<std::experimental::optional<T>> : public type_printer<T> {
+        /*inline const std::string& print() {
+            return type_printer<T>().print();
+        }*/
+    };
+    
+    
+    template<class T>
+    struct type_printer {
+        inline 
+        std::enable_if_t<std::is_enum<T>::value,const std::string& > 
+        print() {
+            static const std::string res = "INTEGER";
+            return res;
+        }
+    };
+    
     /**
      *  Used to print members mapped to objects.
      */
     template<class T>
     struct field_printer {
         std::string operator()(const T &t) const {
-            return std::to_string(t);
+            return pb::to_string(t);
         }
     };
     
@@ -332,6 +417,17 @@ namespace sqlite_orm {
     template<class T>
     struct field_printer<std::unique_ptr<T>> {
         std::string operator()(const std::unique_ptr<T> &t) const {
+            if(t){
+                return field_printer<T>()(*t);
+            }else{
+                return field_printer<std::nullptr_t>()(nullptr);
+            }
+        }
+    };
+    
+    template<class T>
+    struct field_printer<std::experimental::optional<T>> {
+        std::string operator()(const std::experimental::optional<T> &t) const {
             if(t){
                 return field_printer<T>()(*t);
             }else{
@@ -428,6 +524,29 @@ namespace sqlite_orm {
         R r;
         
         binary_condition(L l_, R r_):l(l_),r(r_){}
+    };
+    
+    template<class L, class R>
+    struct is_equal_t;
+    
+    template<class L, class R>
+    struct is_equal_t<L,std::experimental::optional<R>> : public binary_condition<L, std::experimental::optional<R>> {
+
+        using base = binary_condition<L,std::experimental::optional<R>>;
+        using base::base;
+        
+        operator std::string () const {
+            if (base::r) {
+                return "=";
+            } else {
+                return "IS";
+            }
+        }
+        
+        negated_condition_t<is_equal_t<L, R>> operator!() const {
+            return {*this};
+        }
+
     };
     
     template<class L, class R>
@@ -964,6 +1083,13 @@ namespace sqlite_orm {
         }
     };
     
+    template<>
+    struct statement_binder<bool> {
+        int bind(sqlite3_stmt *stmt, int index, const bool &value) {
+            return sqlite3_bind_int(stmt, index++, value);
+        }
+    };
+    
     /**
      *  Specialization for long.
      */
@@ -1022,21 +1148,65 @@ namespace sqlite_orm {
         }
     };
     
+    template<class T>
+    struct statement_binder<std::experimental::optional<T>>{
+        
+        int bind(sqlite3_stmt *stmt, int index, const std::experimental::optional<T> &value) {
+            if(value){
+                return statement_binder<T>().bind(stmt, index, *value);
+            }else{
+                return statement_binder<std::nullptr_t>().bind(stmt, index, nullptr);
+            }
+        }
+    };
+    
+    template<>
+    struct statement_binder<std::chrono::system_clock::time_point>{
+    
+        int bind(sqlite3_stmt *stmt, int index, const std::chrono::system_clock::time_point &value) {
+            auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                value.time_since_epoch()
+            ).count();
+            return sqlite3_bind_int64(stmt, index++, timestamp);
+        }
+    
+    };
+    
+    template<class T>
+    struct statement_binder{
+        
+        std::enable_if_t<std::is_enum<T>::value,int>
+        bind(sqlite3_stmt *stmt, int index, const T& value) {
+            return sqlite3_bind_int(stmt, index++, (int)value);
+        }
+    
+    };
+    
     /**
      *  Helper class used to cast values from argv to V class 
      *  which depends from column type.
      *
      */
     template<class V>
-    struct row_extrator {
+    struct row_extrator; /*{
         V extract(const char *row_value);
-    };
+    };*/
     
     /**
      *  Specialization for int.
      */
     template<>
     struct row_extrator<int> {
+        int extract(const char *row_value) {
+            return std::atoi(row_value);
+        }
+    };
+    
+    /**
+     *  Specialization for bool.
+     */
+    template<>
+    struct row_extrator<bool> {
         int extract(const char *row_value) {
             return std::atoi(row_value);
         }
@@ -1062,6 +1232,7 @@ namespace sqlite_orm {
         }
     };
     
+    
     /**
      *  Specialization for double.
      */
@@ -1069,6 +1240,13 @@ namespace sqlite_orm {
     struct row_extrator<double> {
         double extract(const char *row_value) {
             return std::atof(row_value);
+        }
+    };
+    
+    template<>
+    struct row_extrator<std::chrono::system_clock::time_point> {
+        std::chrono::system_clock::time_point extract(const char *row_value) {
+            return std::chrono::system_clock::from_time_t(atol(row_value));
         }
     };
     
@@ -1088,6 +1266,17 @@ namespace sqlite_orm {
         std::shared_ptr<T> extract(const char *row_value) {
             if(row_value){
                 return std::make_shared<T>(row_extrator<T>().extract(row_value));
+            }else{
+                return {};
+            }
+        }
+    };
+    
+    template<class T>
+    struct row_extrator<std::experimental::optional<T>> {
+        std::experimental::optional<T> extract(const char *row_value) {
+            if(row_value){
+                return std::experimental::optional<T>(row_extrator<T>().extract(row_value));
             }else{
                 return {};
             }
@@ -1116,6 +1305,16 @@ namespace sqlite_orm {
         void extract(std::tuple<Args...> &t, char **argv) {
             //..
         }
+    };
+    
+    template<class T>
+    struct row_extrator{
+        
+        std::enable_if_t<std::is_enum<T>::value,T>
+        extract(const char *row_value) {
+            return (T)std::atoi(row_value);
+        }
+    
     };
     
     /**
@@ -1379,7 +1578,7 @@ namespace sqlite_orm {
     struct storage_impl<H, Ts...> : public storage_impl<Ts...> {
         typedef H table_type;
         
-        storage_impl(H h, Ts ...ts) : Super(ts...), table(h) {}
+        storage_impl(H h, Ts ...ts) : table(h), Super(ts...) {}
         
         table_type table;
         
@@ -1388,12 +1587,28 @@ namespace sqlite_orm {
             return Super::template type_is_mapped<T>();
         }
         
+        struct Indexes {
+            std::string columnName;
+            bool isUnique{false};
+        };
+        
+        struct ForeignKey {
+            std::string columnName;
+            std::string anotherTable;
+            std::string anotherColumn;
+        };
+        
         void create_table(sqlite3 *db, const std::string &tableName) {
+            std::vector<Indexes> indexes;
+            std::vector<ForeignKey> foreignKeys;
+            std::vector<std::string> uniqueKeys;
+            
+        
             std::stringstream ss;
             ss << "CREATE TABLE " << tableName << " ( ";
             auto columnsCount = this->table.columns_count();
-            auto index = 0;
-            this->table.for_each_column([columnsCount, &index, &ss] (auto c) {
+            auto idx = 0;
+            this->table.for_each_column([&] (auto c) {
                 ss << c.name << " ";
                 typedef typename decltype(c)::field_type field_type;
                 ss << type_printer<field_type>().print() << " ";
@@ -1403,18 +1618,62 @@ namespace sqlite_orm {
                 if(c.template has<autoincrement>()) {
                     ss << "AUTOINCREMENT ";
                 }
+                if(c.template has<index>()) {
+                    indexes.push_back(Indexes{
+                        .columnName = c.name,
+                        .isUnique = c.template has<unique>()
+                    });
+                }
+                if(c.template has<unique>()) {
+                    uniqueKeys.push_back(c.name);
+                }
+                
                 /*if(c.template has<default_t<field_type>>()){
                     ff
                 }*/
                 if(c.not_null()){
                     ss << "NOT NULL ";
                 }
-                if(index < columnsCount - 1) {
+                if(idx < columnsCount - 1) {
                     ss << ", ";
                 }
-                index++;
+                
+                
+                
+                fit::eval(fit::conditional(
+                    fit::if_(c.template has_<foreign_key>())([&](auto id) {
+                        foreign_key fKey = id(c).template get<foreign_key>();
+                        foreignKeys.push_back(ForeignKey{
+                            .columnName = c.name,
+                            .anotherTable = fKey.table,
+                            .anotherColumn = fKey.column
+                        });
+                    }),[](auto){}
+                ));
+                
+                idx++;
             });
-            ss << ") ";
+            
+            for(auto fkey : foreignKeys) {
+                ss << ", FOREIGN KEY(" << fkey.columnName << ")" << " REFERENCES " << fkey.anotherTable << "(" << fkey.anotherColumn << ")";
+            }
+            
+            for(auto ukey : uniqueKeys) {
+                ss << ", CONSTRAINT constraint_unique_" << ukey << " UNIQUE(" << ukey << ")";
+            }
+            
+            
+            ss << "); ";
+            
+            for (auto indexColumn : indexes) {
+                ss << "CREATE ";
+                if (indexColumn.isUnique) {
+                    ss << "UNIQUE ";
+                }
+                ss <<  "INDEX idx_" << indexColumn.columnName << " ON " << this->table.name << " (" << indexColumn.columnName << " ASC);";
+                
+            }
+            
             auto query = ss.str();
             sqlite3_stmt *stmt;
             if (sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
@@ -1476,10 +1735,12 @@ namespace sqlite_orm {
                 if (sqlite3_step(stmt) == SQLITE_DONE) {
                     res = int(sqlite3_last_insert_rowid(db));
                 }else{
-                    throw std::runtime_error(sqlite3_errmsg(db));
+                    auto err = sqlite3_errmsg(db);
+                    throw std::runtime_error(err);
                 }
             }else {
-                throw std::runtime_error(sqlite3_errmsg(db));
+                auto err = sqlite3_errmsg(db);
+                throw std::runtime_error(err);
             }
             return res;
         }
